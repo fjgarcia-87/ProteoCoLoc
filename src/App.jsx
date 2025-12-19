@@ -44,20 +44,20 @@ const calculateDensity = (positions, length, windowSize, smoothingFactor = 0) =>
 
 // Pure Analytic Function for a single protein
 const analyzeProtein = (protein, params) => {
-    const { ssWindowSize, ssThreshold, ssSmoothing, glycoWindowSize, glycoThreshold, glycoSmoothing } = params;
+    // Note: Phosphorylation uses the SAME parameters as Glycosylation (glyco*)
+    const { 
+        ssWindowSize, ssThreshold, ssSmoothing, 
+        glycoWindowSize, glycoThreshold, glycoSmoothing 
+    } = params;
     const length = protein.length;
 
     // 1. Calculate Densities
     const ssDensity = calculateDensity(protein.ssBonds, length, ssWindowSize, ssSmoothing);
     const nDensity = calculateDensity(protein.nLinked, length, glycoWindowSize, glycoSmoothing);
-    // Note: O-linked uses same parameters as N-linked per requirements, but we calculate its density map
-    // However, for Co-localization definition, usually we look at SS vs Glyco. 
-    // If the requirement is strictly SS vs N-Linked for the "Zone", we keep nDensity.
-    // If O-linked should also define the zone, we might need to sum them or treat separately.
-    // Based on prompt "las de O-linked tiene que usar los mismos parametros... usar como control negativo", 
-    // usually implies we check if O-linked falls in the SS-rich zone defined by parameters.
+    // Phosphorylation shares glyco parameters
+    const pDensity = calculateDensity(protein.phosphorylation, length, glycoWindowSize, glycoSmoothing);
     
-    // We define the "High Density Zone" based on SS + N-Linked (the primary analysis)
+    // We define the "High Density Zone" based on SS + N-Linked (the primary analysis target)
     const isHighDensityZone = new Array(length).fill(false);
     for(let i=0; i<length; i++) {
         if(ssDensity[i] >= ssThreshold && nDensity[i] >= glycoThreshold) {
@@ -66,7 +66,7 @@ const analyzeProtein = (protein, params) => {
     }
 
     // Helper to process a list of sites
-    const processSites = (sites, typeChar) => {
+    const processSites = (sites, typeCode, typeLabel) => {
         return sites.map(pos => {
             const arrayIndex = pos - 1; 
             
@@ -82,37 +82,61 @@ const analyzeProtein = (protein, params) => {
             return {
                 gene: protein.gene,
                 accession: protein.id,
-                glycosite: `${typeChar}${pos}`,
-                type: typeChar === 'N' ? 'N-Linked' : 'O-Linked',
+                scientificName: protein.scientificName,
+                glycosite: `${typeCode}${pos}`, // e.g. N123, P456
+                type: typeLabel,
                 inUniProtDisulfide: embeddedInSS,
                 inHighDensityZone: inHighDensity
             };
         });
     };
 
-    const nRows = processSites(protein.nLinked, 'N');
-    const oRows = processSites(protein.oLinked, 'O');
+    const nRows = processSites(protein.nLinked, 'N', 'N-Linked');
+    const oRows = processSites(protein.oLinked, 'O', 'O-Linked');
+    const pRows = processSites(protein.phosphorylation, 'P', 'Phospho');
 
-    return [...nRows, ...oRows];
+    return [...nRows, ...oRows, ...pRows];
 };
 
 const fetchUniprotData = async (geneName) => {
-  try {
-    const searchUrl = `https://rest.uniprot.org/uniprotkb/search?query=gene_exact:${geneName} AND organism_id:9606 AND reviewed:true&fields=accession,gene_names,length,sequence,ft_disulfid,ft_carbohyd&format=json&size=1`;
-    
-    const searchRes = await fetch(searchUrl);
-    if (!searchRes.ok) throw new Error(`UniProt API Error: ${searchRes.statusText}`);
-    const searchData = await searchRes.json();
+  const maxRetries = 2;
+  let attempt = 0;
 
-    if (!searchData.results || searchData.results.length === 0) {
-      throw new Error(`Gene "${geneName}" not found in Homo sapiens (TaxID: 9606).`);
+  while (attempt <= maxRetries) {
+    try {
+      const cleanGene = geneName.trim();
+      const query = `(gene_exact:"${cleanGene}") AND (organism_id:9606) AND (reviewed:true)`;
+      // FIXED: Using 'ft_mod_res' which is the correct field name for Modified Residues in UniProt API
+      const fields = "accession,gene_names,length,sequence,ft_disulfid,ft_carbohyd,ft_mod_res,organism_name";
+      const searchUrl = `https://rest.uniprot.org/uniprotkb/search?query=${encodeURIComponent(query)}&fields=${fields}&format=json&size=1`;
+      
+      const searchRes = await fetch(searchUrl);
+      
+      if (!searchRes.ok) {
+        let errorDetails = searchRes.statusText;
+        try {
+            const errorJson = await searchRes.json();
+            if (errorJson.messages) errorDetails = errorJson.messages.join(", ");
+        } catch (e) { /* ignore */ }
+        throw new Error(`UniProt API Error (${searchRes.status}): ${errorDetails}`);
+      }
+      
+      const searchData = await searchRes.json();
+
+      if (!searchData.results || searchData.results.length === 0) {
+        throw new Error(`Gene "${geneName}" not found in Homo sapiens (TaxID: 9606).`);
+      }
+
+      return parseUniProtEntry(searchData.results[0]);
+    } catch (error) {
+      console.error(`Fetch Error (Attempt ${attempt + 1}/${maxRetries + 1}):`, error);
+      if (error.message.includes("not found")) return null;
+      attempt++;
+      if (attempt > maxRetries) return null;
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
-
-    return parseUniProtEntry(searchData.results[0]);
-  } catch (error) {
-    console.error("Fetch Error:", error);
-    return null; 
   }
+  return null;
 };
 
 // Centralized parser to convert UniProt JSON to our internal format
@@ -120,8 +144,9 @@ const parseUniProtEntry = (entry) => {
     const sequence = entry.sequence.value;
     const length = entry.sequence.length;
     const features = entry.features || [];
+    
+    const scientificName = entry.organism ? entry.organism.scientificName : "Unknown Species";
 
-    // Gene Name logic
     let geneName = entry.primaryAccession;
     if (entry.genes && entry.genes.length > 0 && entry.genes[0].geneName) {
         geneName = entry.genes[0].geneName.value;
@@ -131,6 +156,7 @@ const parseUniProtEntry = (entry) => {
     const ssBondRanges = [];
     const nLinked = [];
     const oLinked = [];
+    const phosphorylation = [];
 
     features.forEach(f => {
         if (f.type === 'Disulfide bond') {
@@ -142,18 +168,25 @@ const parseUniProtEntry = (entry) => {
             } else if (f.description.includes('O-linked')) {
                 oLinked.push(f.location.start.value);
             }
+        } else if (f.type === 'Modified residue') {
+            const desc = f.description ? f.description.toLowerCase() : "";
+            if (desc.includes('phospho')) {
+                phosphorylation.push(f.location.start.value);
+            }
         }
     });
 
     return {
         id: entry.primaryAccession,
         gene: geneName,
+        scientificName,
         length,
         sequence,
         ssBonds,
-        ssBondRanges, // Needed for "Embedded" check
+        ssBondRanges, 
         nLinked,
-        oLinked
+        oLinked,
+        phosphorylation
     };
 };
 
@@ -189,12 +222,14 @@ const parseFasta = (text) => {
             proteins.push({
                 id: currentHeader.substring(1, 10),
                 gene: gene,
+                scientificName: "Custom FASTA",
                 length: currentSeq.length,
                 sequence: currentSeq,
                 ssBonds: ssBonds, 
                 ssBondRanges: [], 
                 nLinked: nLinked,
-                oLinked: [] 
+                oLinked: [],
+                phosphorylation: []
             });
         }
     };
@@ -227,6 +262,7 @@ const Badge = ({ color, text }) => {
     blue: "bg-sky-100 text-sky-800 border-sky-200",
     red: "bg-red-100 text-red-800 border-red-200",
     yellow: "bg-yellow-100 text-yellow-800 border-yellow-200",
+    purple: "bg-purple-100 text-purple-800 border-purple-200",
     green: "bg-emerald-100 text-emerald-800 border-emerald-200",
     gray: "bg-slate-100 text-slate-600 border-slate-200"
   };
@@ -263,10 +299,12 @@ export default function App() {
   const [data, setData] = useState(null);
   
   // --- Parameters ---
+  // Group 1: SS
   const [ssWindowSize, setSsWindowSize] = useState(50);
   const [ssThreshold, setSsThreshold] = useState(3);
   const [ssSmoothing, setSsSmoothing] = useState(5); 
   
+  // Group 2: Glyco (Shared with Phospho)
   const [glycoWindowSize, setGlycoWindowSize] = useState(50);
   const [glycoThreshold, setGlycoThreshold] = useState(3);
   const [glycoSmoothing, setGlycoSmoothing] = useState(5); 
@@ -343,8 +381,9 @@ export default function App() {
     const ssDensity = calculateDensity(data.ssBonds, data.length, ssWindowSize, ssSmoothing);
     const nDensity = calculateDensity(data.nLinked, data.length, glycoWindowSize, glycoSmoothing);
     const oDensity = calculateDensity(data.oLinked, data.length, glycoWindowSize, glycoSmoothing);
+    const pDensity = calculateDensity(data.phosphorylation, data.length, glycoWindowSize, glycoSmoothing); // Uses Glyco params
 
-    let csvContent = "Position,Amino_Acid,SS_Density,N_Linked_Density,O_Linked_Density,Is_HighDensity_Zone\n";
+    let csvContent = "Scientific_Name,Position,Amino_Acid,SS_Density,N_Linked_Density,O_Linked_Density,Phospho_Density,Is_HighDensity_Zone\n";
 
     for (let i = 0; i < data.length; i++) {
         const isOverlap = (ssDensity[i] >= ssThreshold && nDensity[i] >= glycoThreshold);
@@ -352,11 +391,13 @@ export default function App() {
         const aa = data.sequence[i] || '-';
         
         const row = [
+            `"${data.scientificName}"`,
             pos,
             aa,
             ssDensity[i].toFixed(4), 
             nDensity[i].toFixed(4),
             oDensity[i].toFixed(4),
+            pDensity[i].toFixed(4),
             isOverlap ? "TRUE" : "FALSE"
         ].join(",");
         
@@ -377,9 +418,9 @@ export default function App() {
   // --- BATCH PROCESSING LOGIC ---
 
   const downloadBatchCSV = (rows) => {
-      const header = "Gene_Name,Type,Glycosite,In_UniProt_Disulfide_Bond,In_HighDensity_Colocalization_Zone\n";
+      const header = "Scientific_Name,Gene_Name,Type,Site_ID,In_UniProt_Disulfide_Bond,In_HighDensity_Colocalization_Zone\n";
       const content = rows.map(r => 
-        `${r.gene},${r.type},${r.glycosite},${r.inUniProtDisulfide ? "TRUE" : "FALSE"},${r.inHighDensityZone ? "TRUE" : "FALSE"}`
+        `"${r.scientificName}",${r.gene},${r.type},${r.glycosite},${r.inUniProtDisulfide ? "TRUE" : "FALSE"},${r.inHighDensityZone ? "TRUE" : "FALSE"}`
       ).join('\n');
       
       const blob = new Blob([header + content], { type: 'text/csv;charset=utf-8;' });
@@ -393,6 +434,7 @@ export default function App() {
   };
 
   const processBatchList = (proteins) => {
+      // Pass glyco params as they are shared for phospho
       const params = { ssWindowSize, ssThreshold, ssSmoothing, glycoWindowSize, glycoThreshold, glycoSmoothing };
       let results = [];
       proteins.forEach(prot => {
@@ -417,11 +459,18 @@ export default function App() {
 
       try {
           while(hasMore) {
-             let url = `https://rest.uniprot.org/uniprotkb/search?query=organism_id:${organismId} AND reviewed:true&fields=accession,gene_names,length,sequence,ft_disulfid,ft_carbohyd&format=json&size=${size}`;
+             const query = `(organism_id:${organismId}) AND (reviewed:true)`;
+             // FIXED: Using 'ft_mod_res' here as well
+             const fields = "accession,gene_names,length,sequence,ft_disulfid,ft_carbohyd,ft_mod_res,organism_name";
+             let url = `https://rest.uniprot.org/uniprotkb/search?query=${encodeURIComponent(query)}&fields=${fields}&format=json&size=${size}`;
              if (nextCursor) url += `&cursor=${nextCursor}`;
 
              const res = await fetch(url);
-             if (!res.ok) throw new Error("API Error");
+             if (!res.ok) {
+                 let errorMsg = res.statusText;
+                 try { const e = await res.json(); if(e.messages) errorMsg = e.messages.join(", "); } catch(x){}
+                 throw new Error(`API Error ${res.status}: ${errorMsg}`);
+             }
              const json = await res.json();
 
              const total = Number(res.headers.get('x-total-results')) || 20400;
@@ -458,7 +507,7 @@ export default function App() {
 
       } catch (err) {
           console.error(err);
-          setError("Error during bulk analysis. Check your connection or Organism ID.");
+          setError(`Error during bulk analysis: ${err.message}`);
           setBatchStatus("idle");
       }
   };
@@ -488,6 +537,8 @@ export default function App() {
     const ssDensity = calculateDensity(data.ssBonds, data.length, ssWindowSize, ssSmoothing);
     const nDensity = calculateDensity(data.nLinked, data.length, glycoWindowSize, glycoSmoothing);
     const oDensity = calculateDensity(data.oLinked, data.length, glycoWindowSize, glycoSmoothing);
+    // Phospho uses Glyco params
+    const pDensity = calculateDensity(data.phosphorylation, data.length, glycoWindowSize, glycoSmoothing);
 
     const step = Math.max(1, Math.ceil(data.length / 600)); 
     const points = [];
@@ -502,12 +553,13 @@ export default function App() {
         ss: ssDensity[i],
         nLinked: nDensity[i],
         oLinked: oDensity[i],
+        phos: pDensity[i],
         overlapHeight: isOverlap ? Math.max(ssDensity[i], nDensity[i]) * 1.1 : 0 
       });
     }
     
     if (points.length > 0 && points[points.length - 1].pos < data.length) {
-        points.push({ pos: data.length, ss: 0, nLinked: 0, oLinked: 0, overlapHeight: 0 });
+        points.push({ pos: data.length, ss: 0, nLinked: 0, oLinked: 0, phos: 0, overlapHeight: 0 });
     }
     
     return points;
@@ -595,11 +647,13 @@ export default function App() {
             <div className="flex flex-wrap gap-4 items-center text-sm text-slate-600 bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
               <span className="font-semibold text-slate-900">ID: {data.id}</span>
               <div className="w-px h-4 bg-slate-300 mx-2"></div>
+              <span className="font-semibold text-slate-900">Species: {data.scientificName}</span>
+              <div className="w-px h-4 bg-slate-300 mx-2"></div>
               <span className="font-semibold text-slate-900">Length: {data.length} aa</span>
               <div className="w-px h-4 bg-slate-300 mx-2"></div>
               <Badge color="blue" text={`${data.ssBonds.length} Disulfides`} />
               <Badge color="red" text={`${data.nLinked.length} N-Linked`} />
-              <Badge color="yellow" text={`${data.oLinked.length} O-Linked`} />
+              <Badge color="purple" text={`${data.phosphorylation.length} Phospho`} />
             </div>
 
             {view === 'calibration' && (
@@ -615,7 +669,7 @@ export default function App() {
                     </div>
                     {/* Calibration Charts */}
                     <div className="flex items-end mb-1">
-                        <div className="w-16 text-xs font-bold text-slate-400 text-right pr-3 pb-6">Density</div>
+                        <div className="w-20 text-xs font-bold text-slate-400 text-right pr-3 pb-6">Density</div>
                         <div className="flex-1 h-64 relative border-b border-slate-200">
                             <ResponsiveContainer width="100%" height="100%">
                                 <ComposedChart data={chartData} syncId="proteinView" margin={commonMargins}>
@@ -626,6 +680,7 @@ export default function App() {
                                     <Area type="monotone" dataKey="ss" stroke="#38bdf8" fill="#38bdf8" fillOpacity={0.2} strokeWidth={2} name="SS Density" />
                                     <Line type="monotone" dataKey="nLinked" stroke="#f43f5e" strokeWidth={2} dot={false} name="N-Linked Density" />
                                     <Line type="monotone" dataKey="oLinked" stroke="#eab308" strokeWidth={2} strokeDasharray="5 5" dot={false} name="O-Linked Density" />
+                                    <Line type="monotone" dataKey="phos" stroke="#a855f7" strokeWidth={2} dot={false} name="Phospho Density" />
                                     <ReferenceLine y={ssThreshold} stroke="#38bdf8" strokeDasharray="3 3" opacity={0.5} />
                                     <ReferenceLine y={glycoThreshold} stroke="#f43f5e" strokeDasharray="3 3" opacity={0.5} />
                                 </ComposedChart>
@@ -633,7 +688,7 @@ export default function App() {
                         </div>
                     </div>
                     <div className="flex items-center mb-1">
-                        <div className="w-16 text-xs font-bold text-sky-500 text-right pr-3">Raw SS</div>
+                        <div className="w-20 text-xs font-bold text-sky-500 text-right pr-3">Raw SS</div>
                         <div className="flex-1 h-6 bg-slate-100 rounded overflow-hidden relative">
                             <ResponsiveContainer width="100%" height="100%">
                                 <ComposedChart data={chartData} syncId="proteinView" margin={commonMargins}>
@@ -648,7 +703,7 @@ export default function App() {
                         </div>
                     </div>
                     <div className="flex items-center mb-1">
-                        <div className="w-16 text-xs font-bold text-rose-500 text-right pr-3">Raw N-Gly</div>
+                        <div className="w-20 text-xs font-bold text-rose-500 text-right pr-3">Raw N-Gly</div>
                         <div className="flex-1 h-6 bg-slate-100 rounded overflow-hidden relative">
                             <ResponsiveContainer width="100%" height="100%">
                                 <ComposedChart data={chartData} syncId="proteinView" margin={commonMargins}>
@@ -662,8 +717,8 @@ export default function App() {
                             </ResponsiveContainer>
                         </div>
                     </div>
-                     <div className="flex items-center">
-                        <div className="w-16 text-xs font-bold text-yellow-600 text-right pr-3">Raw O-Gly</div>
+                     <div className="flex items-center mb-1">
+                        <div className="w-20 text-xs font-bold text-yellow-600 text-right pr-3">Raw O-Gly</div>
                         <div className="flex-1 h-6 bg-slate-100 rounded overflow-hidden relative">
                             <ResponsiveContainer width="100%" height="100%">
                                 <ComposedChart data={chartData} syncId="proteinView" margin={commonMargins}>
@@ -677,11 +732,26 @@ export default function App() {
                             </ResponsiveContainer>
                         </div>
                     </div>
+                    <div className="flex items-center">
+                        <div className="w-20 text-xs font-bold text-purple-600 text-right pr-3">Raw Phospho</div>
+                        <div className="flex-1 h-6 bg-slate-100 rounded overflow-hidden relative">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <ComposedChart data={chartData} syncId="proteinView" margin={commonMargins}>
+                                    <XAxis dataKey="pos" type="number" domain={[0, data.length]} height={xAxisHeight} hide />
+                                    <YAxis hide />
+                                    <Tooltip cursor={{ stroke: 'black', strokeWidth: 1 }} content={<></>} />
+                                    {data.phosphorylation.map((pos, i) => (
+                                        <ReferenceLine key={`p-${i}`} x={pos} stroke="#9333ea" strokeWidth={1} />
+                                    ))}
+                                </ComposedChart>
+                            </ResponsiveContainer>
+                        </div>
+                    </div>
                   </Card>
                 </div>
 
                 <div className="space-y-6">
-                    <Card className="p-6 bg-white h-full">
+                    <Card className="p-6 bg-white h-full overflow-y-auto max-h-[800px]">
                         <h3 className="font-bold text-slate-800 mb-4 flex items-center gap-2">
                              <Sliders className="w-4 h-4" /> Calibration Controls
                         </h3>
@@ -697,7 +767,7 @@ export default function App() {
 
                         <div className="mb-6">
                             <h4 className="text-xs font-bold text-rose-600 uppercase tracking-wider mb-3 flex items-center gap-1">
-                                <div className="w-2 h-2 bg-rose-500 rounded-full"></div> Glycosylation (N & O)
+                                <div className="w-2 h-2 bg-rose-500 rounded-full"></div> Glyco & Phospho
                             </h4>
                             <ParameterControl label="Window Size" value={glycoWindowSize} onChange={setGlycoWindowSize} min={10} max={200} step={5} unit="aa" colorClass="accent-rose-500" />
                             <ParameterControl label="Threshold" value={glycoThreshold} onChange={setGlycoThreshold} min={1} max={10} step={0.5} unit="sites" colorClass="accent-rose-500" />
@@ -739,7 +809,8 @@ export default function App() {
                                     ))}
                                     <Area type="monotone" dataKey="ss" stroke="#38bdf8" fill="#38bdf8" fillOpacity={0.1} strokeWidth={2} name="Disulfide" />
                                     <Line type="monotone" dataKey="nLinked" stroke="#f43f5e" strokeWidth={2} dot={false} name="N-Linked" />
-                                    <Line type="monotone" dataKey="oLinked" stroke="#eab308" strokeWidth={2} strokeDasharray="5 5" dot={false} name="O-Linked (Ctrl)" />
+                                    <Line type="monotone" dataKey="oLinked" stroke="#eab308" strokeWidth={2} strokeDasharray="5 5" dot={false} name="O-Linked" />
+                                    <Line type="monotone" dataKey="phos" stroke="#a855f7" strokeWidth={2} dot={false} name="Phospho" />
                                 </ComposedChart>
                             </ResponsiveContainer>
                         </div>
